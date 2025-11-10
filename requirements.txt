@@ -2,3 +2,6 @@ pandas
 openpyxl
 playwright
 requests
+xlrd==1.2.0
+lxml
+html5lib
