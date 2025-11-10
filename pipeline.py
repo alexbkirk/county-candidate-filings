@@ -210,23 +210,20 @@ def load_dataframe_from_file(path: Path) -> pd.DataFrame:
 
 
 
-def split_by_county(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    candidates = ["County", "county", "COUNTY"]
-    col = next((c for c in df.columns if c in candidates), None)
-    if not col:
-        matches = [c for c in df.columns if c.lower() == "county"]
-        if matches:
-            col = matches[0]
-        else:
-            raise ValueError(f"Couldn't find a 'County' column. Columns: {list(df.columns)}")
+def split_by_county(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    # Try to find a column whose name contains 'county'
+    candidates = [c for c in df.columns if "county" in str(c).lower()]
+    if not candidates:
+        raise ValueError(f"Couldn't find a County column. Columns: {list(df.columns)}")
+    col = candidates[0]
 
     df[col] = df[col].astype(str).str.strip()
-    groups: Dict[str, pd.DataFrame] = {}
+    groups = {}
     for county, sub in df.groupby(col, dropna=True):
-        c = county.strip()
-        if not c:
+        name = str(county).strip()
+        if not name:
             continue
-        groups[c] = sub.reset_index(drop=True)
+        groups[name] = sub.reset_index(drop=True)
     return groups
 
 
