@@ -112,17 +112,62 @@ def playwright_download_xlsx(dest_dir: Path) -> Path:
 
 
 def load_dataframe_from_file(path: Path) -> pd.DataFrame:
-    if path.suffix.lower() in (".xlsx", ".xls"):
-        df = pd.read_excel(path, engine="openpyxl")
-    elif path.suffix.lower() == ".csv":
-        df = pd.read_csv(path)
-    else:
+    """
+    Handles:
+      - Real XLSX/XLSM (openpyxl)
+      - Legacy XLS (xlrd==1.2.0)
+      - Excel-HTML disguised as .xls (read_html)
+      - CSV fallback
+    """
+    suffix = path.suffix.lower()
+
+    # Helper: choose the first table that looks like the right one
+    def pick_table_with_county(dfs):
+        if not dfs:
+            return None
+        # prefer a table that actually has a County column
+        for df in dfs:
+            cols = [str(c).strip().lower() for c in df.columns]
+            if "county" in cols:
+                return df
+        # else just return the largest table
+        return max(dfs, key=lambda d: (len(d.columns), len(d)))
+
+    # 1) Try modern Excel first if xlsx-like
+    if suffix in (".xlsx", ".xlsm", ".xltx", ".xltm"):
         try:
-            df = pd.read_excel(path, engine="openpyxl")
+            return pd.read_excel(path, engine="openpyxl")
         except Exception:
-            df = pd.read_csv(path)
-    df.columns = [c.strip() for c in df.columns]
-    return df
+            pass
+
+    # 2) If .xls, try xlrd 1.2.0
+    if suffix == ".xls":
+        try:
+            return pd.read_excel(path, engine="xlrd")
+        except Exception:
+            # Many "xls" downloads are actually HTML. Try HTML next.
+            pass
+
+    # 3) Try HTML table parsing (works for Excel-HTML and general HTML)
+    try:
+        dfs = pd.read_html(str(path))  # uses lxml/html5lib
+        df = pick_table_with_county(dfs)
+        if df is not None:
+            # normalize headers
+            df.columns = [str(c).strip() for c in df.columns]
+            return df
+    except Exception:
+        pass
+
+    # 4) Last resort: CSV
+    try:
+        return pd.read_csv(path)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not parse downloaded file {path.name} as xlsx/xls/html/csv. "
+            f"Original error: {type(e).__name__}: {e}"
+        )
+
 
 
 def split_by_county(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
