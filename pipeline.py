@@ -113,11 +113,11 @@ def playwright_download_xlsx(dest_dir: Path) -> Path:
 
 def load_dataframe_from_file(path: Path) -> pd.DataFrame:
     """
-    Robustly load KY SOS export:
+    Robust loader for KY SOS export:
       - XLSX (zip) -> openpyxl
-      - Legacy XLS (OLE/BIFF) -> xlrd==1.2.0
+      - Legacy XLS (OLE/BIFF) -> xlrd==1.2.0 (direct, bypass pandas)
       - Excel-HTML disguised as .xls -> pandas.read_html
-      - CSV fallback with encoding detection (charset-normalizer)
+      - CSV fallback with encoding detection
     """
     from charset_normalizer import from_path
 
@@ -129,7 +129,7 @@ def load_dataframe_from_file(path: Path) -> pd.DataFrame:
         return b.startswith(b"PK\x03\x04")
 
     def looks_like_ole(b: bytes) -> bool:
-        # OLE Compound File signature for legacy .xls
+        # OLE Compound File header for legacy .xls
         return b.startswith(b"\xD0\xCF\x11\xE0")
 
     def looks_like_html(b: bytes) -> bool:
@@ -140,42 +140,69 @@ def load_dataframe_from_file(path: Path) -> pd.DataFrame:
     def pick_table_with_county(dfs):
         if not dfs:
             return None
-        # prefer a table that has a County column
         for df in dfs:
             cols = [str(c).strip().lower() for c in df.columns]
             if "county" in cols:
                 return df
-        # else return the largest table
         return max(dfs, key=lambda d: (len(d.columns), len(d)))
 
     b = head_bytes(path)
     print(f"[loader] file={path.name} bytes[0:8]={b[:8].hex()} size={path.stat().st_size}")
 
-    # 1) HTML first (many 'xls' downloads are HTML)
+    # 1) HTML (many 'xls' downloads are HTML)
     if looks_like_html(b):
         print("[loader] Detected HTML; parsing via read_html")
         dfs = pd.read_html(str(path))  # needs lxml/html5lib
-        df = pick_table_with_county(dfs)
-        if df is None:
-            # normalize anyway
-            df = dfs[0]
+        df = pick_table_with_county(dfs) or dfs[0]
         df.columns = [str(c).strip() for c in df.columns]
         return df
 
-    # 2) XLSX (zip) -> openpyxl
-    if looks_like_zip(b):
-        print("[loader] Detected XLSX zip; using openpyxl")
+    # 2) XLSX-like (zip) -> openpyxl
+    if looks_like_zip(b) or path.suffix.lower() in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+        print("[loader] Detected XLSX zip or xlsx-like; using openpyxl")
         return pd.read_excel(path, engine="openpyxl")
 
-    # 3) Legacy XLS (OLE/BIFF) -> xlrd
+    # 3) Legacy XLS (OLE/BIFF) -> xlrd DIRECT (bypass pandas)
     if looks_like_ole(b) or path.suffix.lower() == ".xls":
-        print("[loader] Detected legacy XLS; using xlrd")
+        print("[loader] Detected legacy XLS; using xlrd (direct)")
         try:
-            return pd.read_excel(path, engine="xlrd")
-        except Exception as e:
-            print(f"[loader] xlrd failed: {type(e).__name__}: {e}")
+            import xlrd  # 1.2.0
+            book = xlrd.open_workbook(str(path))
+            sheet = book.sheet_by_index(0)
 
-    # 4) Try openpyxl as a last Excel attempt (covers rare mislabeled xlsx)
+            # Extract rows
+            rows = []
+            for r in range(sheet.nrows):
+                rows.append([sheet.cell_value(r, c) for c in range(sheet.ncols)])
+
+            if not rows:
+                raise RuntimeError("XLS appears empty.")
+
+            # Use first non-empty row as header
+            header_row_idx = 0
+            while header_row_idx < len(rows) and all((str(v).strip() == "" for v in rows[header_row_idx])):
+                header_row_idx += 1
+            header = [str(h).strip() for h in rows[header_row_idx]]
+            data = rows[header_row_idx + 1:]
+
+            # If the header looks binary garbage, try the next row as header
+            if len(header) == 1 and len("".join(header)) > 100:
+                if header_row_idx + 1 < len(rows):
+                    header = [str(h).strip() for h in rows[header_row_idx + 1]]
+                    data = rows[header_row_idx + 2:]
+
+            df = pd.DataFrame(data, columns=header)
+            # Drop fully-empty columns that happen in BIFF exports
+            df = df.dropna(axis=1, how="all")
+            # Normalize column names
+            df.columns = [str(c).strip() for c in df.columns]
+            return df
+
+        except Exception as e:
+            print(f"[loader] xlrd direct failed: {type(e).__name__}: {e}")
+            # fall through to other attempts
+
+    # 4) Try openpyxl as last Excel attempt (rare mislabeled files)
     try:
         print("[loader] Trying openpyxl as fallback")
         return pd.read_excel(path, engine="openpyxl")
@@ -192,7 +219,6 @@ def load_dataframe_from_file(path: Path) -> pd.DataFrame:
             return pd.read_csv(path, encoding=enc)
         except Exception as e1:
             print(f"[loader] csv read with {enc} failed: {type(e1).__name__}: {e1}")
-            # Retry common Windows encodings
             for enc2 in ("cp1252", "latin-1"):
                 try:
                     print(f"[loader] Retrying csv with encoding={enc2}")
@@ -206,17 +232,15 @@ def load_dataframe_from_file(path: Path) -> pd.DataFrame:
         f"Could not parse downloaded file {path.name} as html/xlsx/xls/csv after multiple attempts."
     )
 
-
-
-
-
 def split_by_county(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    # Try to find a column whose name contains 'county'
+    # Look for any column that contains 'county' (case-insensitive)
     candidates = [c for c in df.columns if "county" in str(c).lower()]
     if not candidates:
+        # Debug: show columns to logs
+        print("[split] Columns:", list(df.columns))
         raise ValueError(f"Couldn't find a County column. Columns: {list(df.columns)}")
-    col = candidates[0]
 
+    col = candidates[0]
     df[col] = df[col].astype(str).str.strip()
     groups = {}
     for county, sub in df.groupby(col, dropna=True):
@@ -225,6 +249,7 @@ def split_by_county(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
             continue
         groups[name] = sub.reset_index(drop=True)
     return groups
+
 
 
 def dataframe_to_bytes(df: pd.DataFrame) -> bytes:
