@@ -113,85 +113,99 @@ def playwright_download_xlsx(dest_dir: Path) -> Path:
 
 def load_dataframe_from_file(path: Path) -> pd.DataFrame:
     """
-    Robustly load the KY export which can be:
-      - Real XLSX/XLSM (zip-based; openpyxl)
-      - Legacy XLS (BIFF8; xlrd==1.2.0)
-      - Excel-HTML ('.xls' but actually HTML with a <table>)
-      - CSV (fallback)
+    Robustly load KY SOS export:
+      - XLSX (zip) -> openpyxl
+      - Legacy XLS (OLE/BIFF) -> xlrd==1.2.0
+      - Excel-HTML disguised as .xls -> pandas.read_html
+      - CSV fallback with encoding detection (charset-normalizer)
     """
-    suffix = path.suffix.lower()
+    from charset_normalizer import from_path
 
-    def is_probably_html(p: Path) -> bool:
-        try:
-            with open(p, "rb") as f:
-                head = f.read(4096).strip().lower()
-            # Heuristics: HTML-ish or XML-ish with table
-            return (head.startswith(b"<") and (b"<html" in head or b"<table" in head or b"<meta" in head)) \
-                   or b"content-type" in head and b"text/html" in head
-        except Exception:
-            return False
+    def head_bytes(p: Path, n: int = 8192) -> bytes:
+        with open(p, "rb") as f:
+            return f.read(n)
+
+    def looks_like_zip(b: bytes) -> bool:
+        return b.startswith(b"PK\x03\x04")
+
+    def looks_like_ole(b: bytes) -> bool:
+        # OLE Compound File signature for legacy .xls
+        return b.startswith(b"\xD0\xCF\x11\xE0")
+
+    def looks_like_html(b: bytes) -> bool:
+        lb = b.lower()
+        return (lb.startswith(b"<") and (b"<html" in lb or b"<table" in lb or b"<!doctype" in lb)) \
+               or (b"content-type" in lb and b"text/html" in lb)
 
     def pick_table_with_county(dfs):
         if not dfs:
             return None
-        # Prefer a table with a County column
+        # prefer a table that has a County column
         for df in dfs:
             cols = [str(c).strip().lower() for c in df.columns]
             if "county" in cols:
                 return df
-        # else largest-ish table
+        # else return the largest table
         return max(dfs, key=lambda d: (len(d.columns), len(d)))
 
-    print(f"[loader] filename={path.name} suffix={suffix}")
+    b = head_bytes(path)
+    print(f"[loader] file={path.name} bytes[0:8]={b[:8].hex()} size={path.stat().st_size}")
 
-    # 0) If it looks like HTML (common for ".xls" exports), parse as HTML first
-    if is_probably_html(path):
-        print("[loader] Detected HTML-styled file; parsing with read_html")
-        try:
-            dfs = pd.read_html(str(path))  # needs lxml/html5lib
-            df = pick_table_with_county(dfs)
-            if df is not None:
-                df.columns = [str(c).strip() for c in df.columns]
-                return df
-            # If we got here, read_html worked but didn't find a good table → fall through
-        except Exception as e:
-            print(f"[loader] read_html failed: {type(e).__name__}: {e}")
+    # 1) HTML first (many 'xls' downloads are HTML)
+    if looks_like_html(b):
+        print("[loader] Detected HTML; parsing via read_html")
+        dfs = pd.read_html(str(path))  # needs lxml/html5lib
+        df = pick_table_with_county(dfs)
+        if df is None:
+            # normalize anyway
+            df = dfs[0]
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
 
-    # 1) True XLSX-like formats → openpyxl
-    if suffix in (".xlsx", ".xlsm", ".xltx", ".xltm"):
-        try:
-            print("[loader] Trying openpyxl for xlsx/xlsm")
-            return pd.read_excel(path, engine="openpyxl")
-        except Exception as e:
-            print(f"[loader] openpyxl failed: {type(e).__name__}: {e}")
+    # 2) XLSX (zip) -> openpyxl
+    if looks_like_zip(b):
+        print("[loader] Detected XLSX zip; using openpyxl")
+        return pd.read_excel(path, engine="openpyxl")
 
-    # 2) Legacy XLS → xlrd==1.2.0
-    if suffix == ".xls":
+    # 3) Legacy XLS (OLE/BIFF) -> xlrd
+    if looks_like_ole(b) or path.suffix.lower() == ".xls":
+        print("[loader] Detected legacy XLS; using xlrd")
         try:
-            print("[loader] Trying xlrd for legacy .xls")
             return pd.read_excel(path, engine="xlrd")
         except Exception as e:
             print(f"[loader] xlrd failed: {type(e).__name__}: {e}")
-        # If xlrd failed and it wasn't detected as HTML above, try HTML again as fallback
-        try:
-            print("[loader] Fallback: trying read_html on .xls")
-            dfs = pd.read_html(str(path))
-            df = pick_table_with_county(dfs)
-            if df is not None:
-                df.columns = [str(c).strip() for c in df.columns]
-                return df
-        except Exception as e:
-            print(f"[loader] read_html fallback failed: {type(e).__name__}: {e}")
 
-    # 3) CSV fallback
+    # 4) Try openpyxl as a last Excel attempt (covers rare mislabeled xlsx)
     try:
-        print("[loader] Fallback: trying CSV")
-        return pd.read_csv(path)
+        print("[loader] Trying openpyxl as fallback")
+        return pd.read_excel(path, engine="openpyxl")
     except Exception as e:
-        raise RuntimeError(
-            f"Could not parse downloaded file {path.name} as html/xlsx/xls/csv. "
-            f"Last error: {type(e).__name__}: {e}"
-        )
+        print(f"[loader] openpyxl fallback failed: {type(e).__name__}: {e}")
+
+    # 5) CSV fallback with encoding detection and retries
+    print("[loader] Trying CSV with encoding detection")
+    try:
+        result = from_path(str(path)).best()
+        enc = (result.encoding if result else None) or "utf-8"
+        print(f"[loader] Detected encoding={enc}")
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception as e1:
+            print(f"[loader] csv read with {enc} failed: {type(e1).__name__}: {e1}")
+            # Retry common Windows encodings
+            for enc2 in ("cp1252", "latin-1"):
+                try:
+                    print(f"[loader] Retrying csv with encoding={enc2}")
+                    return pd.read_csv(path, encoding=enc2, engine="python", on_bad_lines="skip")
+                except Exception as e2:
+                    print(f"[loader] csv read with {enc2} failed: {type(e2).__name__}: {e2}")
+    except Exception as e:
+        print(f"[loader] encoding detection failed: {type(e).__name__}: {e}")
+
+    raise RuntimeError(
+        f"Could not parse downloaded file {path.name} as html/xlsx/xls/csv after multiple attempts."
+    )
+
 
 
 
